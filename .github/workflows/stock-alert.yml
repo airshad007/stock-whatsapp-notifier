@@ -1,0 +1,44 @@
+name: Stock Price Alert Check
+
+on:
+  schedule:
+    # Every 15 minutes, roughly covering the US market session (9:30am-4pm
+    # Eastern) with some buffer on each side. Times are UTC and do NOT
+    # auto-adjust for daylight saving - this window is set for ET during EDT
+    # (UTC-4). During EST (UTC-5, roughly Nov-Mar) it will run about an hour
+    # earlier relative to the market open/close - shift by +1 hour in
+    # November and -1 hour back in March if you want it pinned exactly.
+    - cron: "*/15 13-21 * * 1-5"
+  workflow_dispatch: {} # lets you trigger a run manually from the Actions tab, for testing
+
+permissions:
+  contents: write # needed so the workflow can commit alert_state.json back to the repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - run: python notifier.py check --threshold 5.0
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # alert_state.json tracks which tickers have already alerted today so
+      # you don't get pinged every 15 minutes for the same move. Since
+      # Actions runners are thrown away after each run, that state has to be
+      # committed back to the repo to persist between runs.
+      - name: Persist alert state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add alert_state.json
+          git diff --staged --quiet || git commit -m "Update alert state [skip ci]"
+          git push
