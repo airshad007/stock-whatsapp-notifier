@@ -1,29 +1,20 @@
 #!/usr/bin/env python3
 """
-Stock price -> WhatsApp notifier, using Meta's WhatsApp Cloud API directly
-(no Twilio or other middleman).
+Stock price -> Telegram notifier.
 
 Usage:
-    python notifier.py send              # fetch prices and send a WhatsApp message
-    python notifier.py send --freeform   # send as a plain-text message instead of a
-                                          # template (only works inside an open 24h
-                                          # WhatsApp "customer service window" - i.e.
-                                          # you must have messaged the business number
-                                          # from your phone in the last 24h). Useful for
-                                          # quick manual testing.
+    python notifier.py send              # fetch prices and send a Telegram message
+    python notifier.py send --dry-run    # print the message instead of sending it
     python notifier.py add TSLA          # add a ticker to the dynamic watchlist
     python notifier.py remove TSLA       # remove a ticker from the watchlist
     python notifier.py list              # print the current watchlist
 
 Watchlist is stored in tickers.json next to this script, so you can also just
-open that file and edit the list by hand at any time.
+open that file (or edit it on GitHub) and change the list by hand at any time.
 
 Required environment variables (see .env.example):
-    WHATSAPP_PHONE_NUMBER_ID   - the "Phone number ID" of your WhatsApp Cloud API sender
-    WHATSAPP_ACCESS_TOKEN      - a permanent (System User) access token, NOT the 24h temp token
-    WHATSAPP_TEMPLATE_NAME     - name of your approved message template (see README)
-    WHATSAPP_TEMPLATE_LANG     - template language code, e.g. en_US
-    WHATSAPP_TO_NUMBER         - your own WhatsApp number in E.164 digits, no "+", e.g. 14155551234
+    TELEGRAM_BOT_TOKEN  - token for the bot you create via @BotFather
+    TELEGRAM_CHAT_ID    - the chat id sendMessage should deliver to (your own chat with the bot)
 """
 
 import argparse
@@ -40,7 +31,6 @@ from dotenv import load_dotenv
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TICKERS_FILE = SCRIPT_DIR / "tickers.json"
-GRAPH_API_VERSION = "v21.0"
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
 load_dotenv(SCRIPT_DIR / ".env")
@@ -112,93 +102,50 @@ def fetch_prices(tickers: list[str]) -> list[dict]:
                 prev_close = float(hist["Close"].iloc[-2])
             change_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
             results.append({"symbol": symbol, "price": price, "change_pct": change_pct})
-        except Exception as exc:  # noqa: BLE001 - we want to keep going for other tickers
+        except Exception as exc:  # noqa: BLE001 - keep going for other tickers
             print(f"WARNING: failed to fetch {symbol}: {exc}", file=sys.stderr)
     return results
 
 
 # --------------------------------------------------------------------------
-# Message formatting
-#
-# NOTE: WhatsApp template parameters cannot contain newline/tab characters or
-# more than 4 consecutive spaces, so the whole report is built as a single
-# line with a separator, rather than one stock per line.
+# Message formatting - a "card": title/timestamp, then one aligned line per
+# ticker inside a monospace block. Telegram has no line-break restriction
+# (that was a WhatsApp-template-only limitation), so this renders as a clean
+# little table in the chat.
 # --------------------------------------------------------------------------
 
 def format_message(prices: list[dict]) -> str:
     now = datetime.now(LOCAL_TZ).strftime("%b %d, %I:%M %p %Z")
-    parts = []
+    header = f"<b>\U0001F4C8 Stock Update</b>\n<i>{now}</i>"
+
+    if not prices:
+        return f"{header}\n\nNo data available."
+
+    symbol_width = max(len(p["symbol"]) for p in prices)
+    lines = []
     for p in prices:
-        arrow = "+" if p["change_pct"] >= 0 else ""
-        parts.append(f"{p['symbol']} ${p['price']:.2f} ({arrow}{p['change_pct']:.2f}%)")
-    body = " | ".join(parts) if parts else "no data"
-    return f"Stock update ({now}): {body}"
+        up = p["change_pct"] >= 0
+        arrow = "\U0001F7E2" if up else "\U0001F534"  # green/red circle
+        sign = "+" if up else ""
+        lines.append(
+            f"{p['symbol']:<{symbol_width}}  ${p['price']:>8.2f}  {arrow} {sign}{p['change_pct']:.2f}%"
+        )
+    table = "\n".join(lines)
+    return f"{header}\n\n<pre>{table}</pre>"
 
 
 # --------------------------------------------------------------------------
-# Sending via Meta's WhatsApp Cloud API directly
+# Sending via Telegram's Bot API
 # --------------------------------------------------------------------------
 
-def _graph_url() -> str:
-    phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
-    return f"https://graph.facebook.com/{GRAPH_API_VERSION}/{phone_number_id}/messages"
-
-
-def _headers() -> dict:
-    token = os.environ["WHATSAPP_ACCESS_TOKEN"]
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-
-def _recipients() -> list[str]:
-    """WHATSAPP_TO_NUMBERS is a comma-separated list of E.164 digits (no '+').
-    Falls back to the older single-number WHATSAPP_TO_NUMBER for compatibility."""
-    raw = os.environ.get("WHATSAPP_TO_NUMBERS") or os.environ.get("WHATSAPP_TO_NUMBER", "")
-    return [n.strip() for n in raw.split(",") if n.strip()]
-
-
-def send_template_message(body_text: str) -> None:
-    """Send using an approved template - required for proactive/scheduled messages
-    sent outside a 24h customer-service window, which a twice-a-day cron job always is."""
-    template_name = os.environ["WHATSAPP_TEMPLATE_NAME"]
-    template_lang = os.environ.get("WHATSAPP_TEMPLATE_LANG", "en_US")
-
-    for to_number in _recipients():
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_number,
-            "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": template_lang},
-                "components": [
-                    {
-                        "type": "body",
-                        "parameters": [{"type": "text", "text": body_text}],
-                    }
-                ],
-            },
-        }
-        _post(payload)
-
-
-def send_freeform_message(body_text: str) -> None:
-    """Plain text message. Only deliverable if the recipient messaged this WhatsApp
-    business number within the last 24 hours (an open customer-service window).
-    Handy for manual testing; not reliable for an unattended scheduled job."""
-    for to_number in _recipients():
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_number,
-            "type": "text",
-            "text": {"body": body_text},
-        }
-        _post(payload)
-
-
-def _post(payload: dict) -> None:
-    resp = requests.post(_graph_url(), headers=_headers(), json=payload, timeout=20)
+def send_telegram_message(text: str) -> None:
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    resp = requests.post(url, json=payload, timeout=20)
     if resp.status_code >= 400:
-        print(f"WhatsApp API error {resp.status_code}: {resp.text}", file=sys.stderr)
+        print(f"Telegram API error {resp.status_code}: {resp.text}", file=sys.stderr)
         resp.raise_for_status()
     print("Message sent:", resp.json())
 
@@ -219,12 +166,7 @@ def main() -> None:
     p_remove = sub.add_parser("remove", help="Remove a ticker from the watchlist")
     p_remove.add_argument("symbol")
 
-    p_send = sub.add_parser("send", help="Fetch prices and send the WhatsApp update")
-    p_send.add_argument(
-        "--freeform",
-        action="store_true",
-        help="Send as plain text instead of an approved template (only works within an open 24h window)",
-    )
+    p_send = sub.add_parser("send", help="Fetch prices and send the Telegram update")
     p_send.add_argument("--dry-run", action="store_true", help="Print the message instead of sending it")
 
     args = parser.parse_args()
@@ -245,10 +187,7 @@ def main() -> None:
         if args.dry_run:
             print(message)
             return
-        if args.freeform:
-            send_freeform_message(message)
-        else:
-            send_template_message(message)
+        send_telegram_message(message)
 
 
 if __name__ == "__main__":
